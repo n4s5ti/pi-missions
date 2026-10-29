@@ -46,7 +46,7 @@ Requires Pi v0.64.0+.
 /mission Build a user authentication system
 ```
 
-Pi opens a **planning questionnaire** — choose your mode, autonomy level, and optionally assign different models to different phases — then kicks off the mission.
+Pi opens a **planning questionnaire** — choose your mode, autonomy level, and optionally assign different models to different phases — then kicks off the mission. Right after mission creation, pi can prompt you to open **Mission Control** immediately.
 
 ### Commands
 
@@ -54,12 +54,12 @@ Pi opens a **planning questionnaire** — choose your mode, autonomy level, and 
 |---------|-------------|
 | `/mission <description>` | Start a new mission (interactive planner) |
 | `/mission` | Quick-check current mission status |
-| `/mission-status` | Detailed status with phase/feature durations |
-| `/mission-features` | Browse features grouped by milestone (full mode) |
-| `/mission-validate` | Show validation assertion status |
-| `/mission-skip` | Skip the current phase or feature |
+| `/mission-status` | Detailed status with phase durations |
+| `/mission-skip` | Skip the current phase |
 | `/mission-done` | Mark the entire mission as complete |
 | `/mission-pause` | Toggle pause/resume |
+| `/mission-next` | Manually advance to the next phase |
+| `/mission-resume` | Resume with a mission handoff after pause or compaction |
 | `/mission-reset` | Clear mission state and widget |
 
 ### Keyboard shortcut
@@ -89,11 +89,11 @@ P: Pause  S: Skip  D: Done  R: Redirect  M: Models  V: Validate  Esc: Close
 | Key | Action |
 |-----|--------|
 | `P` | Pause / Resume |
-| `S` | Skip current phase or feature |
+| `S` | Skip current phase |
 | `D` | Mark mission done |
 | `R` | Redirect — type a new instruction for the agent |
 | `M` | Edit per-phase model assignment |
-| `V` | Show validation contract status |
+| `V` | Reserved for future validation actions |
 
 ## Modes
 
@@ -102,7 +102,6 @@ Choose your mode when starting a mission:
 | Mode | Structure | Best for |
 |------|-----------|----------|
 | **Standard** | 6 phases: Architect → Review → Implement → Test → Audit → Verify | Most development tasks |
-| **Full** | Milestones + features + validation assertions | Large multi-feature projects |
 | **Minimal** | 3 phases: Plan → Build → Verify | Quick fixes and small changes |
 
 ### Standard / Minimal — phase widget
@@ -110,13 +109,6 @@ Choose your mode when starting a mission:
 ```
 🎯 Build user authentication
 ████▓░░░ 📐 Phase 2/6: Review Plan (1/6 done)
-```
-
-### Full — feature widget
-
-```
-● Running  ██████████▓░░░  12/15 features
-🎯 Build user authentication · Milestone: auth · Feature: jwt-tokens
 ```
 
 ### Paused
@@ -135,9 +127,11 @@ Choose your mode when starting a mission:
 │  /mission Build a CRM                                       │
 │     │                                                       │
 │     ├─► Planning questionnaire                              │
-│     │     Mode? Standard / Full / Minimal                   │
+│     │     Mode? Standard / Minimal                          │
 │     │     Autonomy? Low / Medium / High                     │
 │     │     Models? (optional per-phase assignment)           │
+│     │                                                       │
+│     ├─► Optional "Open Mission Control now?" prompt         │
 │     │                                                       │
 │     ├─► Mission protocol injected into system prompt        │
 │     │   on every turn (before_agent_start)                  │
@@ -145,18 +139,12 @@ Choose your mode when starting a mission:
 │     ├─► LLM output scanned after each turn                  │
 │     │   (message_end) for:                                  │
 │     │     Phase transitions ("Phase 1 complete")            │
-│     │     Feature transitions ("Feature cart-api done")     │
-│     │     Milestone transitions                             │
-│     │     Assertion results ("VAL-AUTH-001 passed")         │
 │     │     Spec approval ("Plan approved")                   │
 │     │                                                       │
 │     ├─► State persists in session entries                   │
 │     │   (survives /compact and session restarts)            │
 │     │                                                       │
 │     └─► Widget + Mission Control show live progress         │
-│                                                             │
-│  Full mode: AI uses mission_update tool to register         │
-│  features and assertions after spec approval                │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -165,7 +153,7 @@ Choose your mode when starting a mission:
 On every turn, the extension appends:
 
 - **Mission protocol** — instructions for the current phase (planning, execution, audit, verify)
-- **Current status** — mission description, phase/feature/milestone position, progress counts
+- **Current status** — mission description, phase position, and progress counts
 - **Autonomy guidance** — when to pause based on Low/Medium/High setting
 - **Pause notice** — if paused, tells the agent to wait for direction
 
@@ -186,8 +174,8 @@ Models switch automatically when phases transition. Uses your actual `modelRegis
 
 | Level | Behavior |
 |-------|----------|
-| **Low** | Pause after every feature, wait for "continue" |
-| **Medium** | Pause at milestone boundaries and decision points (default) |
+| **Low** | Pause after every phase, wait for review |
+| **Medium** | Pause at phase boundaries and decision points (default) |
 | **High** | Run to completion, only pause on critical failure |
 
 ### State persistence
@@ -196,29 +184,18 @@ Mission state is stored via `pi.appendEntry()` — custom entries survive `/comp
 
 `/mission-reset` appends a null marker that tells the restore logic to stay cleared — the old state won't reappear.
 
-### Full mode — mission_update tool
-
-In full mode, a custom LLM-callable tool (`mission_update`) is registered. After spec approval, the AI calls it to:
-
-- Add features to milestones
-- Add validation assertions
-- Update feature status (active / done / failed)
-
-This keeps the state in sync with what the AI is actually doing, not just what it announces in text.
-
 ## Architecture
 
 ```
 extensions/
 ├── index.ts             # Thin orchestrator (~290 lines)
-├── types.ts             # All interfaces (MissionState, Feature, Milestone, etc.)
-├── config.ts            # Mission templates (standard / full / minimal)
+├── types.ts             # MissionState, phases, plan artifacts, progress events
+├── config.ts            # Mission templates (standard / minimal)
 ├── state.ts             # Persistence + TypeBox runtime validation
-├── tools.ts             # Custom LLM-callable tool (mission_update)
-├── widget.ts            # Progress widget (phase bar / feature bar / pause)
+├── widget.ts            # Progress widget (phase bar / pause / completion)
 ├── mission-control.ts   # Mission Control overlay (P/S/D/R/M/V)
 ├── progress-log.ts      # Event timeline with relative timestamps
-├── detector.ts          # Phase / feature / milestone / assertion detection
+├── detector.ts          # Phase transition detection
 ├── protocol.ts          # System prompt generation (planning, audit, verify)
 ├── planner.ts           # Interactive planning questionnaire
 ├── commands.ts          # 8 commands + Ctrl+Shift+M shortcut

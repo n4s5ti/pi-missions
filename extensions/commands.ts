@@ -2,6 +2,7 @@
 
 import type {
   ExtensionAPI,
+  ExtensionContext,
   ExtensionCommandContext,
 } from "@mariozechner/pi-coding-agent";
 import { Key } from "@mariozechner/pi-tui";
@@ -40,7 +41,7 @@ async function loadMissionControl(): Promise<void> {
 // ---------------------------------------------------------------------------
 // Use the rich widget from widget.ts (handles all modes, pause, completion)
 function updateWidgetFromCommands(
-  ctx: Pick<ExtensionCommandContext, "ui">,
+  ctx: Pick<ExtensionContext, "ui">,
   state: MissionState | null,
 ): void {
   updateMissionWidget(ctx, state);
@@ -59,10 +60,147 @@ export function registerMissionCommands(
   loadMissionControl();
 
   // Helper: persist + update widget after every state change
-  function persist(ctx: Pick<ExtensionCommandContext, "ui">, state: MissionState): void {
+  function persist(ctx: Pick<ExtensionContext, "ui">, state: MissionState): void {
     setState(state);
     saveMissionState(pi, state);
     updateWidgetFromCommands(ctx, state);
+  }
+
+  function buildMissionControlCallbacks(
+    ctx: Pick<ExtensionContext, "ui" | "modelRegistry">,
+  ): MissionControlCallbacks {
+    return {
+      onPause: () => {
+        const s = getState();
+        if (!s || s.completedAt) return;
+        const now = new Date().toISOString();
+        const updated: MissionState = { ...s, paused: true, pausedAt: now };
+        addProgressEvent(updated, "mission_pause", "Mission paused via Mission Control");
+        setState(updated);
+        saveMissionState(pi, updated);
+        updateWidgetFromCommands(ctx, updated);
+      },
+      onResume: () => {
+        const s = getState();
+        if (!s || !s.paused) return;
+        const now = new Date().toISOString();
+        const pauseEntry = s.pausedAt
+          ? { pausedAt: s.pausedAt, resumedAt: now }
+          : undefined;
+        const updated: MissionState = {
+          ...s,
+          paused: false,
+          pausedAt: undefined,
+          pauseHistory: pauseEntry
+            ? [...s.pauseHistory, pauseEntry]
+            : s.pauseHistory,
+        };
+        addProgressEvent(updated, "mission_resume", "Mission resumed via Mission Control");
+        setState(updated);
+        saveMissionState(pi, updated);
+        updateWidgetFromCommands(ctx, updated);
+      },
+      onSkip: async () => {
+        const ok = await ctx.ui.confirm("Skip", "Skip current phase/feature?");
+        if (!ok) return false;
+        const s = getState();
+        if (!s || s.completedAt) return false;
+        const now = new Date().toISOString();
+
+        const phases = s.phases.map((p) => ({ ...p }));
+        const activeIdx = phases.findIndex((p) => p.status === "active");
+        if (activeIdx === -1) return false;
+        phases[activeIdx].status = "skipped";
+        phases[activeIdx].completedAt = now;
+        const next: Partial<MissionState> = { phases };
+        if (activeIdx + 1 < phases.length) {
+          phases[activeIdx + 1].status = "active";
+          phases[activeIdx + 1].startedAt = now;
+          next.currentPhase = phases[activeIdx + 1].name;
+        } else {
+          next.completedAt = now;
+        }
+        const updated = { ...s, ...next };
+        const skippedName = s.phases[activeIdx]?.name ?? "phase";
+        addProgressEvent(updated, "phase_complete", `Skipped ${skippedName} (via Mission Control)`);
+
+        setState(updated);
+        saveMissionState(pi, updated);
+        updateWidgetFromCommands(ctx, updated);
+        if (updated.completedAt) {
+          pi.setSessionName(`✅ ${updated.description}`);
+        }
+        return true;
+      },
+      onDone: async () => {
+        const ok = await ctx.ui.confirm("Complete", "Mark mission as done?");
+        if (!ok) return false;
+        const s = getState();
+        if (!s) return false;
+        const now = new Date().toISOString();
+
+        // Mark remaining phases as done/skipped
+        const phases = s.phases.map((p) => {
+          if (p.status === "active") return { ...p, status: "done" as const, completedAt: now };
+          if (p.status === "pending") return { ...p, status: "skipped" as const };
+          return { ...p };
+        });
+
+        const updated: MissionState = { ...s, phases, completedAt: now };
+        addProgressEvent(updated, "mission_complete", "Mission completed via Mission Control");
+        setState(updated);
+        saveMissionState(pi, updated);
+        updateWidgetFromCommands(ctx, updated);
+        pi.setSessionName(`✅ ${s.description}`);
+        return true;
+      },
+      onRedirect: (message: string) => {
+        const s = getState();
+        if (s) {
+          addProgressEvent(s, "mission_redirect", message);
+          saveMissionState(pi, s);
+        }
+        pi.sendUserMessage(message);
+      },
+      onModelChange: (role: string, modelId: string) => {
+        const s = getState();
+        if (!s) return;
+        const updated: MissionState = {
+          ...s,
+          modelAssignment: { ...s.modelAssignment, [role]: modelId },
+        };
+        setState(updated);
+        saveMissionState(pi, updated);
+      },
+      getAvailableModels: () => {
+        try {
+          const allModels = ctx.modelRegistry.getAll();
+          return allModels.map((m: any) => ({ label: m.name ?? m.id, id: m.id as string }));
+        } catch {
+          return [];
+        }
+      },
+    };
+  }
+
+  async function openMissionControlFromCommands(
+    ctx: ExtensionContext,
+  ): Promise<void> {
+    if (!showMissionControl) {
+      await loadMissionControl();
+    }
+
+    if (!showMissionControl) {
+      ctx.ui.notify(
+        "Mission Control not available yet. Install mission-control.ts.",
+        "warning",
+      );
+      return;
+    }
+
+    const state = getState();
+    const callbacks = buildMissionControlCallbacks(ctx);
+    await showMissionControl(ctx, state, callbacks, getState);
   }
 
   // -----------------------------------------------------------------------
@@ -130,8 +268,23 @@ export function registerMissionCommands(
           `Analyze the codebase and produce a detailed implementation plan. ` +
           `Present the plan for my approval before implementing.`;
 
-        pi.sendUserMessage(kickoff);
         pi.setSessionName(`🎯 ${description}`);
+        pi.sendUserMessage(kickoff);
+
+        if (!showMissionControl) {
+          await loadMissionControl();
+        }
+
+        if (showMissionControl) {
+          const openMissionControl = await ctx.ui.confirm(
+            "Mission Control",
+            "Open Mission Control now?",
+          );
+          if (openMissionControl) {
+            await openMissionControlFromCommands(ctx);
+          }
+        }
+
         ctx.ui.notify(`🚀 Mission started: ${description}`, "info");
       } catch (err: any) {
         ctx.ui.notify(`Error in /mission: ${err.message}`, "error");
@@ -639,138 +792,7 @@ export function registerMissionCommands(
     description: "Open Mission Control",
     handler: async (ctx) => {
       try {
-        // Lazy-load if not yet available
-        if (!showMissionControl) {
-          await loadMissionControl();
-        }
-
-        if (!showMissionControl) {
-          ctx.ui.notify(
-            "Mission Control not available yet. Install mission-control.ts.",
-            "warning",
-          );
-          return;
-        }
-
-        const state = getState();
-
-        // Build callbacks that tie back to state management
-        const callbacks: MissionControlCallbacks = {
-          onPause: () => {
-            const s = getState();
-            if (!s || s.completedAt) return;
-            const now = new Date().toISOString();
-            const updated: MissionState = { ...s, paused: true, pausedAt: now };
-            addProgressEvent(updated, "mission_pause", "Mission paused via Mission Control");
-            setState(updated);
-            saveMissionState(pi, updated);
-            updateWidgetFromCommands(ctx, updated);
-          },
-          onResume: () => {
-            const s = getState();
-            if (!s || !s.paused) return;
-            const now = new Date().toISOString();
-            const pauseEntry = s.pausedAt
-              ? { pausedAt: s.pausedAt, resumedAt: now }
-              : undefined;
-            const updated: MissionState = {
-              ...s,
-              paused: false,
-              pausedAt: undefined,
-              pauseHistory: pauseEntry
-                ? [...s.pauseHistory, pauseEntry]
-                : s.pauseHistory,
-            };
-            addProgressEvent(updated, "mission_resume", "Mission resumed via Mission Control");
-            setState(updated);
-            saveMissionState(pi, updated);
-            updateWidgetFromCommands(ctx, updated);
-          },
-          onSkip: async () => {
-            const ok = await ctx.ui.confirm("Skip", "Skip current phase/feature?");
-            if (!ok) return false;
-            const s = getState();
-            if (!s || s.completedAt) return false;
-            const now = new Date().toISOString();
-
-            let updated: MissionState;
-
-            const phases = s.phases.map((p) => ({ ...p }));
-            const activeIdx = phases.findIndex((p) => p.status === "active");
-            if (activeIdx === -1) return false;
-            phases[activeIdx].status = "skipped";
-            phases[activeIdx].completedAt = now;
-            const next: Partial<MissionState> = { phases };
-            if (activeIdx + 1 < phases.length) {
-              phases[activeIdx + 1].status = "active";
-              phases[activeIdx + 1].startedAt = now;
-              next.currentPhase = phases[activeIdx + 1].name;
-            } else {
-              next.completedAt = now;
-            }
-            updated = { ...s, ...next };
-            const skippedName = s.phases[activeIdx]?.name ?? "phase";
-            addProgressEvent(updated, "phase_complete", `Skipped ${skippedName} (via Mission Control)`);
-
-            setState(updated);
-            saveMissionState(pi, updated);
-            updateWidgetFromCommands(ctx, updated);
-            if (updated.completedAt) {
-              pi.setSessionName(`✅ ${updated.description}`);
-            }
-            return true;
-          },
-          onDone: async () => {
-            const ok = await ctx.ui.confirm("Complete", "Mark mission as done?");
-            if (!ok) return false;
-            const s = getState();
-            if (!s) return false;
-            const now = new Date().toISOString();
-
-            // Mark remaining phases as done/skipped
-            const phases = s.phases.map((p) => {
-              if (p.status === "active") return { ...p, status: "done" as const, completedAt: now };
-              if (p.status === "pending") return { ...p, status: "skipped" as const };
-              return { ...p };
-            });
-
-            const updated: MissionState = { ...s, phases, completedAt: now };
-            addProgressEvent(updated, "mission_complete", "Mission completed via Mission Control");
-            setState(updated);
-            saveMissionState(pi, updated);
-            updateWidgetFromCommands(ctx, updated);
-            pi.setSessionName(`✅ ${s.description}`);
-            return true;
-          },
-          onRedirect: (message: string) => {
-            const s = getState();
-            if (s) {
-              addProgressEvent(s, "mission_redirect", message);
-              saveMissionState(pi, s);
-            }
-            pi.sendUserMessage(message);
-          },
-          onModelChange: (role: string, modelId: string) => {
-            const s = getState();
-            if (!s) return;
-            const updated: MissionState = {
-              ...s,
-              modelAssignment: { ...s.modelAssignment, [role]: modelId },
-            };
-            setState(updated);
-            saveMissionState(pi, updated);
-          },
-          getAvailableModels: () => {
-            try {
-              const allModels = ctx.modelRegistry.getAll();
-              return allModels.map((m: any) => ({ label: m.name ?? m.id, id: m.id as string }));
-            } catch {
-              return [];
-            }
-          },
-        };
-
-        await showMissionControl(ctx, state, callbacks, getState);
+        await openMissionControlFromCommands(ctx);
       } catch (err: any) {
         ctx.ui.notify(`Error opening Mission Control: ${err.message}`, "error");
       }
